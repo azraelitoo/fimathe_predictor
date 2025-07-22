@@ -8,6 +8,133 @@ import traceback
 
 app = Flask(__name__)
 
+# Gestão de risco: nunca arrisca mais de 2% por trade, metas diárias ajustáveis
+META_DIARIA = 1000  # Alvo diário de lucro (R$)
+STOP_DIARIO = -300  # Stop loss diário (R$ negativo)
+RISCO_POR_TRADE = 0.02  # 2% do saldo máximo por operação
+
+# Função para calcular lote dinâmico baseado no saldo, risco e distância do SL
+def calcula_lote(saldo, price, sl, risco=RISCO_POR_TRADE):
+    dist = abs(price - sl)
+    if dist == 0: dist = 1  # Para evitar divisão por zero
+    lote = max(min(round((saldo * risco) / dist, 2), saldo / 100), 0.01)  # Limita mínimo 0.01
+    return lote
+
+# Múltiplos tipos de entradas FIMATHE (Nivel 1, 2, Reversão, Quebra, Micro)
+def todas_entradas(df, saldo):
+    sinais = []
+    if len(df) < 201:
+        return sinais
+    last = df.iloc[-1]
+    week = df.iloc[-168:]
+    high = week['High'].max()
+    low = week['Low'].min()
+    canal = high - low
+    mid = (high + low) / 2
+    zona_sup = mid + 0.1 * canal
+    zona_inf = mid - 0.1 * canal
+    mm200 = df['Close'].rolling(200).mean().iloc[-1]
+    if pd.isna(mm200):
+        return sinais
+    mm200 = float(mm200)
+    price = float(last['Close'])
+    tendencia = 'up' if price > mm200 else 'down'
+
+    # ---- Nível 1: padrão
+    if price > zona_sup and tendencia == 'up':
+        tp = price + canal * 0.2
+        sl = price - canal * 0.1
+        lote = calcula_lote(saldo, price, sl)
+        sinais.append({
+            'variant': 'nivel_1', 'sinal': 'buy', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 1, 'suggestion': 'execute', 'lot_size': lote
+        })
+    if price < zona_inf and tendencia == 'down':
+        tp = price - canal * 0.2
+        sl = price + canal * 0.1
+        lote = calcula_lote(saldo, price, sl)
+        sinais.append({
+            'variant': 'nivel_1', 'sinal': 'sell', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 1, 'suggestion': 'execute', 'lot_size': lote
+        })
+
+    # ---- Nível 2: reversão zona neutra
+    candle_ant = df.iloc[-2]
+    if price < zona_sup and price > zona_inf:
+        if candle_ant['Close'] > zona_sup and tendencia == 'down':
+            tp = price - canal * 0.1
+            sl = price + canal * 0.1
+            lote = calcula_lote(saldo, price, sl)
+            sinais.append({
+                'variant': 'nivel_2', 'sinal': 'sell', 'tp': round(tp,2), 'sl': round(sl,2),
+                'score': 0.8, 'suggestion': 'execute', 'lot_size': lote
+            })
+        if candle_ant['Close'] < zona_inf and tendencia == 'up':
+            tp = price + canal * 0.1
+            sl = price - canal * 0.1
+            lote = calcula_lote(saldo, price, sl)
+            sinais.append({
+                'variant': 'nivel_2', 'sinal': 'buy', 'tp': round(tp,2), 'sl': round(sl,2),
+                'score': 0.8, 'suggestion': 'execute', 'lot_size': lote
+            })
+
+    # ---- Reversão extremos canal (scalper)
+    if price >= high:
+        tp = price - canal * 0.1
+        sl = price + canal * 0.1
+        lote = calcula_lote(saldo, price, sl, 0.01)  # menos risco
+        sinais.append({
+            'variant': 'reversao', 'sinal': 'sell', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 0.6, 'suggestion': 'execute', 'lot_size': lote
+        })
+    if price <= low:
+        tp = price + canal * 0.1
+        sl = price - canal * 0.1
+        lote = calcula_lote(saldo, price, sl, 0.01)
+        sinais.append({
+            'variant': 'reversao', 'sinal': 'buy', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 0.6, 'suggestion': 'execute', 'lot_size': lote
+        })
+
+    # ---- Quebra de canal (breakout)
+    if price > high * 1.001 and tendencia == 'up':
+        tp = price + canal * 0.3
+        sl = price - canal * 0.1
+        lote = calcula_lote(saldo, price, sl)
+        sinais.append({
+            'variant': 'quebra_canal', 'sinal': 'buy', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 0.7, 'suggestion': 'execute', 'lot_size': lote
+        })
+    if price < low * 0.999 and tendencia == 'down':
+        tp = price - canal * 0.3
+        sl = price + canal * 0.1
+        lote = calcula_lote(saldo, price, sl)
+        sinais.append({
+            'variant': 'quebra_canal', 'sinal': 'sell', 'tp': round(tp,2), 'sl': round(sl,2),
+            'score': 0.7, 'suggestion': 'execute', 'lot_size': lote
+        })
+
+    # ---- Micro-canal: lateralização dentro do canal
+    micro_mid = (zona_sup + zona_inf) / 2
+    if abs(price - micro_mid) < canal * 0.05:
+        if tendencia == 'up':
+            tp = price + canal * 0.05
+            sl = price - canal * 0.05
+            lote = calcula_lote(saldo, price, sl, 0.01)
+            sinais.append({
+                'variant': 'micro', 'sinal': 'buy', 'tp': round(tp,2), 'sl': round(sl,2),
+                'score': 0.5, 'suggestion': 'execute', 'lot_size': lote
+            })
+        if tendencia == 'down':
+            tp = price - canal * 0.05
+            sl = price + canal * 0.05
+            lote = calcula_lote(saldo, price, sl, 0.01)
+            sinais.append({
+                'variant': 'micro', 'sinal': 'sell', 'tp': round(tp,2), 'sl': round(sl,2),
+                'score': 0.5, 'suggestion': 'execute', 'lot_size': lote
+            })
+    return sinais
+
 def load_history(pair, interval='1h', months=12):
     try:
         end = datetime.now()
@@ -24,80 +151,6 @@ def load_history(pair, interval='1h', months=12):
         print(f"Erro ao carregar histórico para {pair}: {e}")
         return None
 
-def fimathe_logic(df):
-    try:
-        if df is None or len(df) < 201:
-            return None
-        last = df.iloc[-1]
-        week = df.iloc[-168:]
-        high = week['High'].max()
-        low = week['Low'].min()
-        canal = high - low
-        mid = (high + low) / 2
-        zona_sup = mid + 0.1*canal
-        zona_inf = mid - 0.1*canal
-        mm200 = df['Close'].rolling(200).mean().iloc[-1]
-        if pd.isna(mm200):
-            return None
-        mm200 = float(mm200)
-        price = float(last['Close'])
-        sinal = None
-        tendencia = 'up' if price > mm200 else 'down'
-        if price > zona_sup and tendencia == 'up': sinal = 'buy'
-        if price < zona_inf and tendencia == 'down': sinal = 'sell'
-        return {
-            'price': price, 'sinal': sinal, 'canal': float(canal),
-            'zona_sup': float(zona_sup), 'zona_inf': float(zona_inf),
-            'tendencia': tendencia, 'timestamp': last.name.strftime('%Y-%m-%d %H:%M')
-        }
-    except Exception as e:
-        print(f"Erro na lógica fimathe: {e}")
-        return None
-
-def stat_predict(df, sinal):
-    try:
-        df['mm200'] = df['Close'].rolling(200).mean()
-        df['tend'] = np.where(df['Close'] > df['mm200'], 'up', 'down')
-        highs = df['High'].rolling(168).max()
-        lows  = df['Low'].rolling(168).min()
-        mid   = (highs + lows) / 2
-        canal = highs - lows
-        zona_sup = mid + 0.1*canal
-        zona_inf = mid - 0.1*canal
-
-        df['fimathe_buy']  = (df['Close'] > zona_sup) & (df['tend']=='up')
-        df['fimathe_sell'] = (df['Close'] < zona_inf) & (df['tend']=='down')
-
-        df['signal'] = None
-        df.loc[df['fimathe_buy'], 'signal'] = 'buy'
-        df.loc[df['fimathe_sell'], 'signal'] = 'sell'
-
-        results = []
-        for i in range(200, len(df)-2):
-            sig = df.iloc[i]['signal']
-            if not sig: continue
-            entry = df.iloc[i]['Close']
-            canal_size = df.iloc[i]['High'] - df.iloc[i]['Low']
-            sl = entry - 2*(canal_size/8) if sig == 'buy' else entry + 2*(canal_size/8)
-            tp = entry + 2*(canal_size/8) if sig == 'buy' else entry - 2*(canal_size/8)
-            window = df.iloc[i+1:i+7]['Close']
-            gain = None
-            for v in window:
-                if sig == 'buy':
-                    if v >= tp: gain = 1; break
-                    if v <= sl: gain = 0; break
-                else:
-                    if v <= tp: gain = 1; break
-                    if v >= sl: gain = 0; break
-            if gain is not None:
-                results.append(gain)
-        if not results: return 0.0, 0
-        acerto = sum(results)/len(results)
-        return acerto, len(results)
-    except Exception as e:
-        print(f"Erro no stat_predict: {e}")
-        return 0.0, 0
-
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -105,15 +158,15 @@ def predict():
             return jsonify({"error": "Request must be JSON"}), 400
         req = request.get_json()
         pair = req.get('pair')
+        saldo = float(req.get('saldo', 200))  # Permite saldo customizável por requisição
         if not pair:
             return jsonify({"error": "Pair not provided"}), 400
         df = load_history(pair)
-        atual = fimathe_logic(df)
-        if not atual or not atual['sinal']:
-            return jsonify({'score': 0, 'suggestion': 'ignore', 'error': 'No valid FIMATHE signal'})
-        score, ntrades = stat_predict(df, atual['sinal'])
-        suggestion = 'execute' if score > 0.65 and ntrades > 30 else 'ignore'
-        return jsonify({**atual, 'score': score, 'ntrades': ntrades, 'suggestion': suggestion})
+        sinais = todas_entradas(df, saldo)
+        if not sinais:
+            return jsonify({'signals': [], 'suggestion': 'ignore', 'error': 'No FIMATHE signal', 'saldo': saldo})
+        # Gestão de banca automática pode ser acoplada aqui se desejar
+        return jsonify({'pair': pair, 'signals': sinais, 'saldo': saldo, 'suggestion': 'execute' if sinais else 'ignore'})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
