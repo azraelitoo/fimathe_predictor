@@ -96,5 +96,9 @@ def predict():
     suggestion = 'execute' if score > 0.65 and ntrades > 30 else 'ignore'
     return jsonify({**atual, 'score': score, 'ntrades': ntrades, 'suggestion': suggestion})
 
+import os
+
 if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))  # Usa a porta que o Railway define, ou 5000 localmente
     app.run(host='0.0.0.0', port=port)
+
