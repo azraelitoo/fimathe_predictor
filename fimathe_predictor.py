@@ -18,7 +18,6 @@ def load_history(pair, interval='1h', months=12):
     return df.dropna()
 
 def fimathe_logic(df):
-    # Exemplo simples: Canal semana, zona neutra, tendência, sinal
     if len(df) < 201: return None
     last = df.iloc[-1]
     week = df.iloc[-168:]
@@ -29,9 +28,14 @@ def fimathe_logic(df):
     zona_sup = mid + 0.1*canal
     zona_inf = mid - 0.1*canal
     mm200 = df['Close'].rolling(200).mean().iloc[-1]
-    tendencia = 'up' if last['Close'] > mm200 else 'down'
+    # Se mm200 for NaN, retorna None
+    if pd.isna(mm200):
+        return None
+    # Aqui garantimos que mm200 é float
+    mm200 = float(mm200)
     price = last['Close']
     sinal = None
+    tendencia = 'up' if price > mm200 else 'down'
     if price > zona_sup and tendencia == 'up': sinal = 'buy'
     if price < zona_inf and tendencia == 'down': sinal = 'sell'
     return {
